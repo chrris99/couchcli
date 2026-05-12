@@ -38,6 +38,12 @@ type Device struct {
 	Label    string `json:"label,omitempty"`
 	Location string `json:"location,omitempty"`
 
+	// MAC is the TV's wired or Wi-Fi MAC address, captured during pair so we
+	// can send Wake-on-LAN magic packets via `couch device on`. Empty for
+	// devices paired before MAC capture was added — run
+	// `couch device mac <alias> <MAC>` to populate.
+	MAC string `json:"mac,omitempty"`
+
 	Name            string    `json:"name,omitempty"`
 	Model           string    `json:"model,omitempty"`
 	SerialNumber    string    `json:"serial_number,omitempty"`

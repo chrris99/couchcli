@@ -55,6 +55,20 @@ func (s *SystemService) Probe(ctx context.Context) (SystemInfo, error) {
 	return SystemInfo{}, ErrNoTVAtHost
 }
 
+// IsAwake reports whether the TV answers a cheap /6/system request within
+// timeout. A standby/off TV either refuses the TCP connection or times out;
+// either case returns false. Suitable as a fast liveness probe (e.g. while
+// polling after Wake-on-LAN).
+func (s *SystemService) IsAwake(ctx context.Context, timeout time.Duration) bool {
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	var sink map[string]any
+	if err := s.client.Do(probeCtx, http.MethodGet, "/6/system", nil, &sink); err != nil {
+		return false
+	}
+	return true
+}
+
 // DetectEndpoint races HTTPS:1926 and HTTP:1925 in parallel and returns the
 // first working Client + SystemInfo. Both attempts use a 2.5s ceiling.
 func DetectEndpoint(ctx context.Context, host string) (*Client, SystemInfo, error) {
