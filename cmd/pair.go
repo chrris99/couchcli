@@ -208,7 +208,7 @@ func runPair(cmd *cobra.Command, args []string) error {
 	if macStr != "" {
 		fmt.Fprintf(cmd.OutOrStdout(), "  couch device on %s   # waking via Wake-on-LAN\n", alias)
 	} else if macWarn != "" {
-		fmt.Fprintf(cmd.ErrOrStderr(), "\nWarning: %s\n  Run `couch device mac %s <MAC>` to enable `couch device on`.\n", macWarn, alias)
+		fmt.Fprintf(cmd.ErrOrStderr(), "\nWarning: %s\n  Re-run `couch pair --mac <MAC> --as %s --force` to enable `couch device on`.\n", macWarn, alias)
 	}
 	return nil
 }

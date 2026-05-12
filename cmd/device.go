@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -31,9 +30,7 @@ var deviceCmd = &cobra.Command{
 
   couch device on  [alias]    Wake the TV via Wake-on-LAN
   couch device off [alias]    Send the TV to standby
-  couch device status [alias] Show awake/asleep status
-  couch device mac <alias> [MAC]
-                              Show or set the MAC used for Wake-on-LAN`,
+  couch device status [alias] Show awake/asleep status`,
 }
 
 var deviceOnCmd = &cobra.Command{
@@ -67,17 +64,6 @@ var deviceStatusCmd = &cobra.Command{
 	RunE:  runDeviceStatus,
 }
 
-var deviceMacCmd = &cobra.Command{
-	Use:   "mac <alias> [MAC]",
-	Short: "Show or set the saved MAC address",
-	Long: `Show the MAC address stored for a paired device, or set it.
-
-The MAC is required by ` + "`couch device on`" + ` to build the Wake-on-LAN
-magic packet. Format: aa:bb:cc:dd:ee:ff or AA-BB-CC-DD-EE-FF.`,
-	Args: cobra.RangeArgs(1, 2),
-	RunE: runDeviceMac,
-}
-
 func init() {
 	deviceOnCmd.Flags().DurationVar(&deviceOnWait, "wait", 20*time.Second, "how long to wait for the TV to come online")
 	deviceOnCmd.Flags().BoolVar(&deviceOnNoWait, "no-wait", false, "return immediately after sending the magic packet")
@@ -87,7 +73,7 @@ func init() {
 	deviceOffCmd.Flags().DurationVar(&deviceOffWait, "timeout", 5*time.Second, "request timeout")
 	deviceStatusCmd.Flags().DurationVar(&deviceProbeWait, "timeout", 2*time.Second, "probe timeout")
 
-	deviceCmd.AddCommand(deviceOnCmd, deviceOffCmd, deviceStatusCmd, deviceMacCmd)
+	deviceCmd.AddCommand(deviceOnCmd, deviceOffCmd, deviceStatusCmd)
 	rootCmd.AddCommand(deviceCmd)
 }
 
@@ -168,7 +154,7 @@ func runDeviceOn(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	if entry.MAC == "" {
-		return fmt.Errorf("no MAC address stored for %q — run `couch device mac %s <MAC>` first", alias, alias)
+		return fmt.Errorf("no MAC address stored for %q — re-pair with `couch pair --mac <MAC> --as %s` to populate it", alias, alias)
 	}
 	mac, err := net.ParseMAC(entry.MAC)
 	if err != nil {
@@ -261,37 +247,3 @@ func runDeviceStatus(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func runDeviceMac(cmd *cobra.Command, args []string) error {
-	alias := args[0]
-	schema, path, err := config.Load()
-	if err != nil {
-		return fmt.Errorf("load config: %w", err)
-	}
-	d, ok := schema.Get(alias)
-	if !ok {
-		return fmt.Errorf("no device %q (paired: %s)", alias, deviceAliases(schema))
-	}
-
-	// Show mode.
-	if len(args) == 1 {
-		if d.MAC == "" {
-			fmt.Fprintf(cmd.OutOrStdout(), "%s: no MAC stored. Set with `couch device mac %s <MAC>`.\n", alias, alias)
-			return nil
-		}
-		fmt.Fprintf(cmd.OutOrStdout(), "%s: %s\n", alias, d.MAC)
-		return nil
-	}
-
-	// Set mode.
-	raw := strings.TrimSpace(args[1])
-	mac, err := net.ParseMAC(raw)
-	if err != nil {
-		return fmt.Errorf("invalid MAC %q: %w", raw, err)
-	}
-	d.MAC = mac.String()
-	if err := schema.Save(path); err != nil {
-		return fmt.Errorf("save config: %w", err)
-	}
-	fmt.Fprintf(cmd.OutOrStdout(), "%s MAC set to %s\n", alias, d.MAC)
-	return nil
-}
