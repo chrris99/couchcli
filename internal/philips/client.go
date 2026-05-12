@@ -15,6 +15,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -45,6 +46,7 @@ type Client struct {
 	Inputs    *InputsService
 	Media     *MediaService
 	Keys      *KeysService
+	Power     *PowerService
 	Ambilight *AmbilightService
 }
 
@@ -63,6 +65,7 @@ func (c *Client) wireServices() {
 	c.Inputs = (*InputsService)(&c.common)
 	c.Media = (*MediaService)(&c.common)
 	c.Keys = (*KeysService)(&c.common)
+	c.Power = (*PowerService)(&c.common)
 	c.Ambilight = (*AmbilightService)(&c.common)
 }
 
@@ -161,6 +164,25 @@ func (c *Client) Port() int {
 		return 1926
 	}
 	return 1925
+}
+
+// IsOn reports whether the panel is actually powered on, not just whether
+// the API answers. It calls /6/powerstate and returns true iff the state is
+// PowerOn. On firmwares that don't expose /6/powerstate (404 →
+// ErrPowerstateUnsupported) the best we can do is fall back to
+// System.IsReachable, where "reachable" is the closest proxy for "on" — the
+// caller should be aware this fallback is a soft signal.
+func (c *Client) IsOn(ctx context.Context, timeout time.Duration) bool {
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	state, err := c.Power.Get(probeCtx)
+	if err == nil {
+		return state == PowerOn
+	}
+	if errors.Is(err, ErrPowerstateUnsupported) {
+		return c.System.IsReachable(ctx, timeout)
+	}
+	return false
 }
 
 // WithDigest attaches credentials so subsequent requests retry with Digest auth

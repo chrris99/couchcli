@@ -20,6 +20,7 @@ import (
 	"github.com/chrris99/couchcli/internal/config"
 	"github.com/chrris99/couchcli/internal/discovery"
 	"github.com/chrris99/couchcli/internal/philips"
+	"github.com/chrris99/couchcli/internal/wol"
 )
 
 var (
@@ -32,6 +33,7 @@ var (
 	pairNameMatch    string
 	pairLabel        string
 	pairLocation     string
+	pairMAC          string
 )
 
 var pairCmd = &cobra.Command{
@@ -61,6 +63,7 @@ func init() {
 	pairCmd.Flags().StringVar(&pairNameMatch, "name", "", "match a discovered TV by name (fuzzy)")
 	pairCmd.Flags().StringVar(&pairLabel, "label", "", "user-supplied friendly name for the TV (e.g. \"Living Room TV\")")
 	pairCmd.Flags().StringVar(&pairLocation, "location", "", "user-supplied location for the TV (e.g. \"Living Room\")")
+	pairCmd.Flags().StringVar(&pairMAC, "mac", "", "TV's MAC address (for Wake-on-LAN); auto-detected from the ARP cache if omitted")
 	rootCmd.AddCommand(pairCmd)
 }
 
@@ -147,6 +150,10 @@ func runPair(cmd *cobra.Command, args []string) error {
 		fmt.Fprintln(cmd.OutOrStdout(), "No pairing required for this device — saving entry.")
 	}
 
+	// 4b. Capture MAC for Wake-on-LAN. Order: --mac override > ARP lookup
+	// against the TV's IP (works because pairing just touched it).
+	macStr, macWarn := resolvePairMAC(ctx, addr)
+
 	// 5. Persist.
 	entry := &config.Device{
 		Address:         addr,
@@ -156,6 +163,7 @@ func runPair(cmd *cobra.Command, args []string) error {
 		AuthKey:         authKey,
 		Label:           strings.TrimSpace(pairLabel),
 		Location:        strings.TrimSpace(pairLocation),
+		MAC:             macStr,
 		Name:            sys.Name,
 		Model:           sys.Model,
 		SerialNumber:    sys.SerialNumber,
@@ -197,7 +205,39 @@ func runPair(cmd *cobra.Command, args []string) error {
 	fmt.Fprintf(cmd.OutOrStdout(),
 		"\nPaired with %s as %q\n  Saved to %s\n\nTry:\n  couch volume\n  couch volume up\n",
 		displayName, alias, schemaPath)
+	if macStr != "" {
+		fmt.Fprintf(cmd.OutOrStdout(), "  couch device on %s   # powerstate=On (Wake-on-LAN fallback if unreachable)\n", alias)
+	} else if macWarn != "" {
+		fmt.Fprintf(cmd.ErrOrStderr(), "\nNote: %s\n  `couch device on` will still work while the TV is reachable. Re-run `couch pair --mac <MAC> --as %s --force` to enable the Wake-on-LAN fallback for when the TV is fully offline.\n", macWarn, alias)
+	}
 	return nil
+}
+
+// resolvePairMAC returns the MAC string to persist, plus a non-empty warning
+// message if no MAC could be resolved. Order: --mac flag (validated), then
+// ARP cache (silent on miss; warning bubbled up).
+func resolvePairMAC(ctx context.Context, addr string) (string, string) {
+	if pairMAC != "" {
+		mac, err := net.ParseMAC(strings.TrimSpace(pairMAC))
+		if err != nil {
+			return "", fmt.Sprintf("--mac %q is not a valid MAC: %v", pairMAC, err)
+		}
+		return mac.String(), ""
+	}
+	// ARP needs a bare IP. If addr is a hostname, resolve to IPv4 first.
+	ip := addr
+	if net.ParseIP(addr) == nil {
+		if ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", addr); err == nil && len(ips) > 0 {
+			ip = ips[0].String()
+		}
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	mac, err := wol.LookupMAC(lookupCtx, ip)
+	if err != nil {
+		return "", fmt.Sprintf("couldn't auto-detect MAC for %s (%v)", addr, err)
+	}
+	return mac.String(), ""
 }
 
 // resolveTarget figures out which address to pair with. Returns (addr,

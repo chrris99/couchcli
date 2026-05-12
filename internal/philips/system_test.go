@@ -104,3 +104,42 @@ func TestProbe_NoEndpoint(t *testing.T) {
 		t.Fatal("expected ErrNoTVAtHost")
 	}
 }
+
+func TestIsReachable_TrueOn200(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/6/system" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{"api_version":{"Major":6}}`))
+	}))
+	defer srv.Close()
+
+	if !newTestClient(t, srv).System.IsReachable(context.Background(), 2*time.Second) {
+		t.Fatal("IsReachable=false, want true")
+	}
+}
+
+func TestIsReachable_FalseOnTimeout(t *testing.T) {
+	// Handler sleeps past the probe timeout.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	if newTestClient(t, srv).System.IsReachable(context.Background(), 30*time.Millisecond) {
+		t.Fatal("IsReachable=true, want false on timeout")
+	}
+}
+
+func TestIsReachable_FalseOnConnRefused(t *testing.T) {
+	// Use a closed server's URL — the next connect will be refused.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	c := newTestClient(t, srv)
+	srv.Close()
+
+	if c.System.IsReachable(context.Background(), 500*time.Millisecond) {
+		t.Fatal("IsReachable=true, want false on connection refused")
+	}
+}

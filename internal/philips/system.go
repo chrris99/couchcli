@@ -55,6 +55,22 @@ func (s *SystemService) Probe(ctx context.Context) (SystemInfo, error) {
 	return SystemInfo{}, ErrNoTVAtHost
 }
 
+// IsReachable reports whether the JointSpace API answers a cheap /6/system
+// request within timeout. On Android Philips TVs the API stays up in soft
+// standby — IsReachable=true does NOT mean the panel is on. Use
+// Client.IsOn (or PowerService.Get) for actual on/off state. A
+// connection-refused TV or a hard timeout returns false; either case is the
+// signal that WoL is needed.
+func (s *SystemService) IsReachable(ctx context.Context, timeout time.Duration) bool {
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	var sink map[string]any
+	if err := s.client.Do(probeCtx, http.MethodGet, "/6/system", nil, &sink); err != nil {
+		return false
+	}
+	return true
+}
+
 // DetectEndpoint races HTTPS:1926 and HTTP:1925 in parallel and returns the
 // first working Client + SystemInfo. Both attempts use a 2.5s ceiling.
 func DetectEndpoint(ctx context.Context, host string) (*Client, SystemInfo, error) {

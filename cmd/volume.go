@@ -17,8 +17,8 @@ var (
 
 var volumeCmd = &cobra.Command{
 	Use:   "volume",
-	Short: "Read or change TV volume",
-	Long: `Control the volume on a paired TV.
+	Short: "Read or change media volume",
+	Long: `Control the volume on a paired device.
 
   couch volume          Show current volume
   couch volume up [N]   Press VolumeUp N times (default 1)
