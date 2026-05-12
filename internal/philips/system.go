@@ -55,11 +55,13 @@ func (s *SystemService) Probe(ctx context.Context) (SystemInfo, error) {
 	return SystemInfo{}, ErrNoTVAtHost
 }
 
-// IsAwake reports whether the TV answers a cheap /6/system request within
-// timeout. A standby/off TV either refuses the TCP connection or times out;
-// either case returns false. Suitable as a fast liveness probe (e.g. while
-// polling after Wake-on-LAN).
-func (s *SystemService) IsAwake(ctx context.Context, timeout time.Duration) bool {
+// IsReachable reports whether the JointSpace API answers a cheap /6/system
+// request within timeout. On Android Philips TVs the API stays up in soft
+// standby — IsReachable=true does NOT mean the panel is on. Use
+// Client.IsOn (or PowerService.Get) for actual on/off state. A
+// connection-refused TV or a hard timeout returns false; either case is the
+// signal that WoL is needed.
+func (s *SystemService) IsReachable(ctx context.Context, timeout time.Duration) bool {
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	var sink map[string]any

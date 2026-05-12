@@ -206,9 +206,9 @@ func runPair(cmd *cobra.Command, args []string) error {
 		"\nPaired with %s as %q\n  Saved to %s\n\nTry:\n  couch volume\n  couch volume up\n",
 		displayName, alias, schemaPath)
 	if macStr != "" {
-		fmt.Fprintf(cmd.OutOrStdout(), "  couch device on %s   # waking via Wake-on-LAN\n", alias)
+		fmt.Fprintf(cmd.OutOrStdout(), "  couch device on %s   # powerstate=On (Wake-on-LAN fallback if unreachable)\n", alias)
 	} else if macWarn != "" {
-		fmt.Fprintf(cmd.ErrOrStderr(), "\nWarning: %s\n  Re-run `couch pair --mac <MAC> --as %s --force` to enable `couch device on`.\n", macWarn, alias)
+		fmt.Fprintf(cmd.ErrOrStderr(), "\nNote: %s\n  `couch device on` will still work while the TV is reachable. Re-run `couch pair --mac <MAC> --as %s --force` to enable the Wake-on-LAN fallback for when the TV is fully offline.\n", macWarn, alias)
 	}
 	return nil
 }

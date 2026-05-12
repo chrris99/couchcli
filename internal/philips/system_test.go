@@ -105,7 +105,7 @@ func TestProbe_NoEndpoint(t *testing.T) {
 	}
 }
 
-func TestIsAwake_TrueOn200(t *testing.T) {
+func TestIsReachable_TrueOn200(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/6/system" {
 			http.NotFound(w, r)
@@ -115,12 +115,12 @@ func TestIsAwake_TrueOn200(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if !newTestClient(t, srv).System.IsAwake(context.Background(), 2*time.Second) {
-		t.Fatal("IsAwake=false, want true")
+	if !newTestClient(t, srv).System.IsReachable(context.Background(), 2*time.Second) {
+		t.Fatal("IsReachable=false, want true")
 	}
 }
 
-func TestIsAwake_FalseOnTimeout(t *testing.T) {
+func TestIsReachable_FalseOnTimeout(t *testing.T) {
 	// Handler sleeps past the probe timeout.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(200 * time.Millisecond)
@@ -128,18 +128,18 @@ func TestIsAwake_FalseOnTimeout(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if newTestClient(t, srv).System.IsAwake(context.Background(), 30*time.Millisecond) {
-		t.Fatal("IsAwake=true, want false on timeout")
+	if newTestClient(t, srv).System.IsReachable(context.Background(), 30*time.Millisecond) {
+		t.Fatal("IsReachable=true, want false on timeout")
 	}
 }
 
-func TestIsAwake_FalseOnConnRefused(t *testing.T) {
+func TestIsReachable_FalseOnConnRefused(t *testing.T) {
 	// Use a closed server's URL — the next connect will be refused.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	c := newTestClient(t, srv)
 	srv.Close()
 
-	if c.System.IsAwake(context.Background(), 500*time.Millisecond) {
-		t.Fatal("IsAwake=true, want false on connection refused")
+	if c.System.IsReachable(context.Background(), 500*time.Millisecond) {
+		t.Fatal("IsReachable=true, want false on connection refused")
 	}
 }
