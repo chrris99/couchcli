@@ -7,22 +7,20 @@ import (
 var (
 	version = "dev"
 
-	jsonOutput   bool
-	prettyOutput bool
+	jsonOutput bool
 )
 
 var rootCmd = &cobra.Command{
 	Use:     "couch",
-	Short:   "Control smart TVs from your terminal",
-	Long:    "couch is a CLI tool for discovering and controlling smart TVs over your local network.",
+	Short:   "Control your home devices from your terminal",
+	Long:    "couch is a CLI tool for discovering and controlling networked home devices, such as TVs, audio, lights and more, over your local network.",
 	Version: version,
 }
 
 func init() {
-	rootCmd.PersistentFlags().BoolVar(&jsonOutput, "json", false, "force JSON output")
-	rootCmd.PersistentFlags().BoolVar(&prettyOutput, "pretty", false, "force table output")
+	rootCmd.PersistentFlags().BoolVar(&jsonOutput, "json", false, "emit machine-readable JSON instead of formatted output")
 }
 
-func Execute() error {
-	return rootCmd.Execute()
+func Root() *cobra.Command {
+	return rootCmd
 }

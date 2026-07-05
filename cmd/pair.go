@@ -1,25 +1,23 @@
 package cmd
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"regexp"
-	"runtime"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
-	"github.com/chrris99/couchcli/internal/config"
+	"github.com/chrris99/couchcli/internal/device"
 	"github.com/chrris99/couchcli/internal/discovery"
-	"github.com/chrris99/couchcli/internal/philips"
+	philipsdriver "github.com/chrris99/couchcli/internal/drivers/philips"
+	"github.com/chrris99/couchcli/internal/registry"
+	"github.com/chrris99/couchcli/internal/ui"
 	"github.com/chrris99/couchcli/internal/wol"
 )
 
@@ -32,7 +30,7 @@ var (
 	pairTimeout      time.Duration
 	pairNameMatch    string
 	pairLabel        string
-	pairLocation     string
+	pairRoom         string
 	pairMAC          string
 )
 
@@ -62,7 +60,7 @@ func init() {
 	pairCmd.Flags().DurationVar(&pairTimeout, "timeout", 2*time.Minute, "overall command timeout")
 	pairCmd.Flags().StringVar(&pairNameMatch, "name", "", "match a discovered TV by name (fuzzy)")
 	pairCmd.Flags().StringVar(&pairLabel, "label", "", "user-supplied friendly name for the TV (e.g. \"Living Room TV\")")
-	pairCmd.Flags().StringVar(&pairLocation, "location", "", "user-supplied location for the TV (e.g. \"Living Room\")")
+	pairCmd.Flags().StringVar(&pairRoom, "room", "", "room the TV is in (e.g. \"living-room\")")
 	pairCmd.Flags().StringVar(&pairMAC, "mac", "", "TV's MAC address (for Wake-on-LAN); auto-detected from the ARP cache if omitted")
 	rootCmd.AddCommand(pairCmd)
 }
@@ -77,24 +75,26 @@ func runPair(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	if hint != "" {
-		fmt.Fprintln(cmd.OutOrStdout(), hint)
+		ui.Infof(cmd.OutOrStdout(), "%s", hint)
 	}
 
 	// 2. Probe to figure out which transport works + grab system info.
-	client, sys, err := philips.DetectEndpoint(ctx, addr)
-	if err != nil {
+	var prof philipsdriver.Profile
+	if err := ui.Spin(ctx, "Probing "+addr+"…", func(sctx context.Context) error {
+		var perr error
+		prof, perr = philipsdriver.Detect(sctx, addr)
+		return perr
+	}); err != nil {
 		return fmt.Errorf("could not reach %s: %w", addr, err)
 	}
-	port := client.Port()
-	secure := client.Secure()
-	displayName := firstNonEmpty(sys.Name, sys.Model, candName, addr)
-	fmt.Fprintf(cmd.OutOrStdout(), "Found %s at %s:%d — %s, API v%d.\n",
-		displayName, addr, port, transportLabel(secure), sys.APIVersionMajor)
+	displayName := firstNonEmpty(prof.Name, prof.Model, candName, addr)
+	ui.Infof(cmd.OutOrStdout(), "Found %s at %s:%d — %s, API v%d.",
+		displayName, addr, prof.Port, transportLabel(prof.Secure), prof.APIVersion)
 
-	// 3. Schema load + alias / collision check.
-	schema, schemaPath, err := config.Load()
+	// 3. Registry load + alias / collision check.
+	reg, err := registry.Load()
 	if err != nil {
-		return fmt.Errorf("load config: %w", err)
+		return fmt.Errorf("load registry: %w", err)
 	}
 	alias := pairAlias
 	if alias == "" {
@@ -103,51 +103,39 @@ func runPair(cmd *cobra.Command, args []string) error {
 			alias = slugify(addr)
 		}
 	}
-	if existing := schema.FindByAddress(addr); existing != "" && existing != alias && !pairForce {
+	if existing := reg.FindByAddress(addr); existing != "" && existing != alias && !pairForce {
 		return fmt.Errorf("%s is already paired as %q — pass --force to overwrite or pair under a new --as alias", addr, existing)
 	}
-	if _, exists := schema.Get(alias); exists && !pairForce {
-		if !confirm(cmd, fmt.Sprintf("Already paired as %q. Overwrite?", alias)) {
-			return errors.New("aborted")
+	if _, exists := reg.Get(alias); exists && !pairForce {
+		ok, cerr := ui.Confirm(fmt.Sprintf("Already paired as %q. Overwrite?", alias))
+		if cerr != nil || !ok {
+			return errors.New("aborted — pass --force to overwrite")
 		}
 	}
 
-	// 4. Run the pair flow if required.
+	// 4. Run the pair flow if required. Each attempt uses a fresh client
+	// (inside philipsdriver.Pair) so a wrong PIN can't poison digest state.
 	var deviceID, authKey string
-	if client.Pair.Required(sys) {
-		if !secure {
+	if prof.PairingRequired {
+		if !prof.Secure {
 			return fmt.Errorf("pairing requires HTTPS:1926 but only HTTP:1925 reachable on %s", addr)
 		}
-		fmt.Fprintln(cmd.OutOrStdout(), "Look at your TV — a PIN should appear on screen.")
-		dev := philips.DeviceInfo{
-			DeviceName: defaultClientName(),
-			DeviceOS:   runtime.GOOS,
-			AppID:      "1",
-			AppName:    "couchcli",
-			Type:       "native",
-		}
-		// philips.Pair attaches digest creds to client on success — make a
-		// fresh client per attempt so a wrong PIN doesn't poison the
-		// digest state for the next retry.
-		var result philips.PairResult
+		ui.Infof(cmd.OutOrStdout(), "Look at your TV — a PIN should appear on screen.")
 		for attempt := 1; attempt <= 3; attempt++ {
-			attemptClient := philips.NewSecure(addr)
-			result, err = attemptClient.Pair.Run(ctx, dev, func(pCtx context.Context) (string, error) {
-				return promptPIN(cmd, pCtx)
+			deviceID, authKey, err = philipsdriver.Pair(ctx, addr, defaultClientName(), func(pCtx context.Context) (string, error) {
+				return ui.PromptPIN(pCtx)
 			})
 			if err == nil {
 				break
 			}
-			if errors.Is(err, philips.ErrPINRejected) && attempt < 3 {
-				fmt.Fprintf(cmd.ErrOrStderr(), "Wrong PIN. Try again (%d of 3).\n", attempt+1)
+			if errors.Is(err, philipsdriver.ErrPINRejected) && attempt < 3 {
+				ui.Warnf(cmd.ErrOrStderr(), "Wrong PIN. Try again (%d of 3).", attempt+1)
 				continue
 			}
 			return pairExitError(err)
 		}
-		deviceID = result.DeviceID
-		authKey = result.AuthKey
 	} else {
-		fmt.Fprintln(cmd.OutOrStdout(), "No pairing required for this device — saving entry.")
+		ui.Infof(cmd.OutOrStdout(), "No pairing required for this device — saving entry.")
 	}
 
 	// 4b. Capture MAC for Wake-on-LAN. Order: --mac override > ARP lookup
@@ -155,60 +143,59 @@ func runPair(cmd *cobra.Command, args []string) error {
 	macStr, macWarn := resolvePairMAC(ctx, addr)
 
 	// 5. Persist.
-	entry := &config.Device{
-		Address:         addr,
-		Port:            port,
-		Secure:          secure,
-		DeviceID:        deviceID,
-		AuthKey:         authKey,
-		Label:           strings.TrimSpace(pairLabel),
-		Location:        strings.TrimSpace(pairLocation),
-		MAC:             macStr,
-		Name:            sys.Name,
-		Model:           sys.Model,
-		SerialNumber:    sys.SerialNumber,
-		SoftwareVersion: sys.SoftwareVersion,
-		APIVersion:      sys.APIVersionMajor,
-		PairedAt:        time.Now().UTC(),
+	settings, err := prof.Settings(deviceID, authKey).Encode()
+	if err != nil {
+		return err
 	}
-	schema.Put(alias, entry)
+	entry := &registry.Device{
+		Driver:     philipsdriver.ID,
+		Address:    addr,
+		MAC:        macStr,
+		HardwareID: prof.SerialNumber,
+		Label:      strings.TrimSpace(pairLabel),
+		Room:       strings.TrimSpace(pairRoom),
+		PairedAt:   time.Now().UTC(),
+		Settings:   settings,
+	}
+	reg.Put(alias, entry)
 	switch {
 	case pairSetDefault:
-		schema.Default = alias
+		reg.Default = alias
 	case pairNoSetDefault:
 	default:
-		if schema.Default == "" {
-			schema.Default = alias
+		if reg.Default == "" {
+			reg.Default = alias
 		}
 	}
-	if err := schema.Save(schemaPath); err != nil {
-		return fmt.Errorf("save config: %w", err)
+	if err := reg.Save(); err != nil {
+		return fmt.Errorf("save registry: %w", err)
 	}
 
 	// 6. Summary.
 	if jsonOutput {
 		out := map[string]any{
-			"alias":    alias,
-			"address":  entry.Address,
-			"port":     entry.Port,
-			"secure":   entry.Secure,
-			"label":    entry.Label,
-			"location": entry.Location,
-			"name":     entry.Name,
-			"model":    entry.Model,
-			"path":     schemaPath,
+			"alias":   alias,
+			"driver":  entry.Driver,
+			"address": entry.Address,
+			"port":    prof.Port,
+			"secure":  prof.Secure,
+			"label":   entry.Label,
+			"room":    entry.Room,
+			"name":    prof.Name,
+			"model":   prof.Model,
+			"path":    reg.Path(),
 		}
 		enc := json.NewEncoder(cmd.OutOrStdout())
 		enc.SetIndent("", "  ")
 		return enc.Encode(out)
 	}
-	fmt.Fprintf(cmd.OutOrStdout(),
-		"\nPaired with %s as %q\n  Saved to %s\n\nTry:\n  couch volume\n  couch volume up\n",
-		displayName, alias, schemaPath)
+	ui.Successf(cmd.OutOrStdout(), "Paired with %s as %q", displayName, alias)
+	ui.Infof(cmd.OutOrStdout(), "  Saved to %s\n\nTry:\n  couch volume\n  couch volume up", reg.Path())
 	if macStr != "" {
-		fmt.Fprintf(cmd.OutOrStdout(), "  couch device on %s   # powerstate=On (Wake-on-LAN fallback if unreachable)\n", alias)
+		ui.Infof(cmd.OutOrStdout(), "  couch device on %s   # powerstate=On (Wake-on-LAN fallback if unreachable)", alias)
 	} else if macWarn != "" {
-		fmt.Fprintf(cmd.ErrOrStderr(), "\nNote: %s\n  `couch device on` will still work while the TV is reachable. Re-run `couch pair --mac <MAC> --as %s --force` to enable the Wake-on-LAN fallback for when the TV is fully offline.\n", macWarn, alias)
+		ui.Warnf(cmd.ErrOrStderr(), "%s", macWarn)
+		ui.Infof(cmd.ErrOrStderr(), "  `couch device on` will still work while the TV is reachable. Re-run `couch pair --mac <MAC> --as %s --force` to enable the Wake-on-LAN fallback for when the TV is fully offline.", alias)
 	}
 	return nil
 }
@@ -247,62 +234,58 @@ func resolveTarget(ctx context.Context, cmd *cobra.Command, args []string) (stri
 		return args[0], "", "", nil
 	}
 	if pairNameMatch != "" {
-		devices, err := discoverForPair(ctx)
+		candidates, err := discoverForPair(ctx)
 		if err != nil {
 			return "", "", "", err
 		}
 		match := strings.ToLower(pairNameMatch)
-		for _, d := range devices {
-			if strings.Contains(strings.ToLower(d.Name), match) {
-				return d.Address, d.Name, fmt.Sprintf("Matched %q to %s at %s", pairNameMatch, d.Name, d.Address), nil
+		for _, c := range candidates {
+			if strings.Contains(strings.ToLower(c.Name), match) {
+				return c.Address, c.Name, fmt.Sprintf("Matched %q to %s at %s", pairNameMatch, c.Name, c.Address), nil
 			}
 		}
 		return "", "", "", fmt.Errorf("no discovered TV matched name %q", pairNameMatch)
 	}
 
 	// Interactive picker.
-	devices, err := discoverForPair(ctx)
+	candidates, err := discoverForPair(ctx)
 	if err != nil {
 		return "", "", "", err
 	}
-	if len(devices) == 0 {
-		return "", "", "", errors.New("no TVs discovered — pass an address explicitly: `couch pair <ip>`")
+	if len(candidates) == 1 {
+		return candidates[0].Address, candidates[0].Name, fmt.Sprintf("Found one TV: %s (%s)", candidates[0].Name, candidates[0].Address), nil
 	}
-	// Collapse to unique addresses (preserving the first row seen).
-	seen := map[string]bool{}
-	var unique []discovery.Device
-	for _, d := range devices {
-		if seen[d.Address] {
-			continue
-		}
-		seen[d.Address] = true
-		unique = append(unique, d)
-	}
-	if len(unique) == 1 {
-		return unique[0].Address, unique[0].Name, fmt.Sprintf("Found one TV: %s (%s)", unique[0].Name, unique[0].Address), nil
-	}
-	out := cmd.OutOrStdout()
-	fmt.Fprintln(out, "Discovered TVs:")
-	for i, d := range unique {
-		fmt.Fprintf(out, "  [%d] %s  %s\n", i+1, d.Name, d.Address)
-	}
-	fmt.Fprint(out, "Pick a number: ")
-	reader := bufio.NewReader(cmd.InOrStdin())
-	line, err := reader.ReadString('\n')
+	picked, err := ui.PickCandidate("Which TV do you want to pair?", candidates)
 	if err != nil {
-		return "", "", "", fmt.Errorf("read selection: %w", err)
+		if errors.Is(err, ui.ErrNotInteractive) {
+			return "", "", "", fmt.Errorf("multiple TVs found — pass an address explicitly: `couch pair <ip>`")
+		}
+		return "", "", "", err
 	}
-	idx, err := strconv.Atoi(strings.TrimSpace(line))
-	if err != nil || idx < 1 || idx > len(unique) {
-		return "", "", "", fmt.Errorf("invalid selection")
-	}
-	return unique[idx-1].Address, unique[idx-1].Name, "", nil
+	return picked.Address, picked.Name, "", nil
 }
 
-func discoverForPair(ctx context.Context) ([]discovery.Device, error) {
-	dctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+// discoverForPair sweeps with only the philips matcher — pairing speaks
+// JointSpace. Sweep errors are fatal only when nothing was found; a partial
+// scan that still saw the TV is good enough to pair with.
+func discoverForPair(ctx context.Context) ([]device.Candidate, error) {
+	dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	return discovery.Discover(dctx, discovery.Options{Timeout: 4 * time.Second})
+	var candidates []device.Candidate
+	var err error
+	if spinErr := ui.Spin(dctx, "Scanning for TVs…", func(sctx context.Context) error {
+		candidates, err = discovery.Sweep(sctx, discovery.Options{Timeout: 4 * time.Second}, philipsdriver.Driver{})
+		return nil
+	}); spinErr != nil {
+		return nil, spinErr
+	}
+	if len(candidates) == 0 {
+		if err != nil {
+			return nil, fmt.Errorf("discovery failed: %w", err)
+		}
+		return nil, errors.New("no TVs discovered — pass an address explicitly: `couch pair <ip>`")
+	}
+	return candidates, nil
 }
 
 func transportLabel(secure bool) string {
@@ -321,39 +304,6 @@ func defaultClientName() string {
 		return "couchcli"
 	}
 	return host
-}
-
-// promptPIN reads a 4-digit PIN from stdin. Echoes (PIN is visible on the TV
-// anyway). Cancels promptly if pCtx expires.
-func promptPIN(cmd *cobra.Command, pCtx context.Context) (string, error) {
-	type res struct {
-		pin string
-		err error
-	}
-	ch := make(chan res, 1)
-	go func() {
-		fmt.Fprint(cmd.OutOrStdout(), "Enter PIN: ")
-		reader := bufio.NewReader(cmd.InOrStdin())
-		line, err := reader.ReadString('\n')
-		ch <- res{pin: strings.TrimSpace(line), err: err}
-	}()
-	select {
-	case <-pCtx.Done():
-		return "", pCtx.Err()
-	case r := <-ch:
-		if r.err != nil && r.err != io.EOF {
-			return "", r.err
-		}
-		return r.pin, nil
-	}
-}
-
-func confirm(cmd *cobra.Command, q string) bool {
-	fmt.Fprintf(cmd.OutOrStdout(), "%s [y/N] ", q)
-	reader := bufio.NewReader(cmd.InOrStdin())
-	line, _ := reader.ReadString('\n')
-	line = strings.ToLower(strings.TrimSpace(line))
-	return line == "y" || line == "yes"
 }
 
 var slugRE = regexp.MustCompile(`[^a-z0-9]+`)
@@ -380,11 +330,11 @@ func firstNonEmpty(values ...string) string {
 // pairExitError maps philips-typed errors to friendly CLI messages.
 func pairExitError(err error) error {
 	switch {
-	case errors.Is(err, philips.ErrPINRejected):
+	case errors.Is(err, philipsdriver.ErrPINRejected):
 		return fmt.Errorf("too many wrong PIN attempts — re-run `couch pair` to retry")
-	case errors.Is(err, philips.ErrTimeout):
+	case errors.Is(err, philipsdriver.ErrTimeout):
 		return fmt.Errorf("pairing timed out — the TV PIN expired; re-run the command")
-	case errors.Is(err, philips.ErrPairingRefused):
+	case errors.Is(err, philipsdriver.ErrPairingRefused):
 		return err
 	}
 	var netErr *net.OpError

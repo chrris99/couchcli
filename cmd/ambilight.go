@@ -2,292 +2,203 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
-	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
 
-	"github.com/chrris99/couchcli/internal/philips"
+	philipsdriver "github.com/chrris99/couchcli/internal/drivers/philips"
+	"github.com/chrris99/couchcli/internal/drivers/philips/effects"
+	"github.com/chrris99/couchcli/internal/ui"
 )
 
 var (
-	ambilightDevice  string
-	ambilightTimeout time.Duration
+	ambilightDevice    string
+	ambilightTimeout   time.Duration
+	ambilightDur       time.Duration
+	ambilightFPS       int
+	ambilightColor     string
+	ambilightNoRestore bool
 )
 
 var ambilightCmd = &cobra.Command{
 	Use:   "ambilight",
-	Short: "Inspect and control the TV's Ambilight LEDs",
-	Long: `Control Philips Ambilight.
+	Short: "Control the TV's Ambilight",
+	Long: `Control a Philips TV's Ambilight LED ring.
 
-  couch ambilight                         Show power + mode + style
-  couch ambilight on / off                Toggle the LED ring
-  couch ambilight mode <internal|manual|expert>
-  couch ambilight style                   List supported styles
-  couch ambilight style <NAME>            Switch to a style (Android firmware)
-  couch ambilight color <hex|name>        Paint a solid color (forces manual mode)
-  couch ambilight topology                Print LED layout`,
-	RunE: runAmbilightStatus,
+  couch ambilight on|off        Toggle Ambilight power
+  couch ambilight style <name>  Set a built-in style (FOLLOW_VIDEO, LOUNGE, …)
+  couch ambilight color <hex>   Paint every LED one color (#RRGGBB)
+  couch ambilight comet|fire|pulse|rainbow|wave   Run an animated effect`,
+}
+
+// ambilightController resolves an alias to a device that supports Ambilight.
+func ambilightController(alias string) (philipsdriver.AmbilightController, string, error) {
+	dev, resolved, err := openDevice(alias)
+	if err != nil {
+		return nil, "", err
+	}
+	ac, ok := dev.(philipsdriver.AmbilightController)
+	if !ok {
+		return nil, resolved, fmt.Errorf("%s does not support ambilight", resolved)
+	}
+	return ac, resolved, nil
+}
+
+func ambilightCtx(cmd *cobra.Command) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(cmd.Context(), ambilightTimeout)
 }
 
 var ambilightOnCmd = &cobra.Command{
-	Use:   "on",
-	Short: "Power Ambilight on",
-	Args:  cobra.NoArgs,
+	Use: "on", Short: "Turn Ambilight on", Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, _ []string) error {
-		return runAmbilightPower(cmd, philips.AmbilightPowerOn)
+		ac, alias, err := ambilightController(ambilightDevice)
+		if err != nil {
+			return err
+		}
+		ctx, cancel := ambilightCtx(cmd)
+		defer cancel()
+		if err := ac.AmbilightOn(ctx); err != nil {
+			return err
+		}
+		ui.Successf(cmd.OutOrStdout(), "%s ambilight on", alias)
+		return nil
 	},
 }
 
 var ambilightOffCmd = &cobra.Command{
-	Use:   "off",
-	Short: "Power Ambilight off",
-	Args:  cobra.NoArgs,
+	Use: "off", Short: "Turn Ambilight off", Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, _ []string) error {
-		return runAmbilightPower(cmd, philips.AmbilightPowerOff)
+		ac, alias, err := ambilightController(ambilightDevice)
+		if err != nil {
+			return err
+		}
+		ctx, cancel := ambilightCtx(cmd)
+		defer cancel()
+		if err := ac.AmbilightOff(ctx); err != nil {
+			return err
+		}
+		ui.Successf(cmd.OutOrStdout(), "%s ambilight off", alias)
+		return nil
 	},
 }
 
-var ambilightModeCmd = &cobra.Command{
-	Use:   "mode <internal|manual|expert>",
-	Short: "Set render mode",
-	Args:  cobra.ExactArgs(1),
-	RunE:  runAmbilightMode,
-}
-
 var ambilightStyleCmd = &cobra.Command{
-	Use:   "style [NAME]",
-	Short: "List supported styles or switch to one",
-	Args:  cobra.MaximumNArgs(1),
-	RunE:  runAmbilightStyle,
+	Use: "style <name>", Short: "Set a built-in Ambilight style", Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ac, alias, err := ambilightController(ambilightDevice)
+		if err != nil {
+			return err
+		}
+		ctx, cancel := ambilightCtx(cmd)
+		defer cancel()
+		style := strings.ToUpper(args[0])
+		if err := ac.SetAmbilightStyle(ctx, style); err != nil {
+			return err
+		}
+		ui.Successf(cmd.OutOrStdout(), "%s ambilight style → %s", alias, style)
+		return nil
+	},
 }
 
 var ambilightColorCmd = &cobra.Command{
-	Use:   "color <hex|name>",
-	Short: "Paint a solid color across all LEDs",
-	Args:  cobra.ExactArgs(1),
-	RunE:  runAmbilightColor,
+	Use: "color <hex>", Short: "Paint every LED one solid color (#RRGGBB)", Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		r, g, b, err := parseHexColor(args[0])
+		if err != nil {
+			return err
+		}
+		ac, alias, err := ambilightController(ambilightDevice)
+		if err != nil {
+			return err
+		}
+		ctx, cancel := ambilightCtx(cmd)
+		defer cancel()
+		if err := ac.SetAmbilightColor(ctx, r, g, b); err != nil {
+			return err
+		}
+		ui.Successf(cmd.OutOrStdout(), "%s ambilight color → %s", alias, args[0])
+		return nil
+	},
 }
 
-var ambilightTopologyCmd = &cobra.Command{
-	Use:   "topology",
-	Short: "Print the LED layout",
-	Args:  cobra.NoArgs,
-	RunE:  runAmbilightTopology,
+// ambilightEffects maps subcommand names to effect constructors. usesColor
+// marks the effects that honour the --color flag (the others pick their own).
+var ambilightEffects = []struct {
+	use       string
+	short     string
+	usesColor bool
+	build     func(c effects.Color) effects.Effect
+}{
+	{"comet", "A bright head chasing the ring with a fading tail", true,
+		func(c effects.Color) effects.Effect { return effects.Comet{Color: c, Period: 3 * time.Second, TailLen: 8} }},
+	{"pulse", "A single color breathing in and out", true,
+		func(c effects.Color) effects.Effect { return effects.Pulse{Color: c, Period: 4 * time.Second, Floor: 0.1} }},
+	{"wave", "A color sweeping around the perimeter", true,
+		func(c effects.Color) effects.Effect { return effects.Wave{Color: c, Period: 4 * time.Second} }},
+	{"rainbow", "A rainbow rotating around the ring", false,
+		func(effects.Color) effects.Effect { return effects.Rainbow{Period: 6 * time.Second, Saturation: 1, Value: 1} }},
+	{"fire", "A flickering fire simulation", false,
+		func(effects.Color) effects.Effect { return effects.NewFire(55, 120, uint64(time.Now().UnixNano())) }},
+}
+
+func runAmbilightEffect(build func(effects.Color) effects.Effect, usesColor bool) func(*cobra.Command, []string) error {
+	return func(cmd *cobra.Command, _ []string) error {
+		var col effects.Color
+		if usesColor {
+			r, g, b, err := parseHexColor(ambilightColor)
+			if err != nil {
+				return err
+			}
+			col = effects.Color{R: r, G: g, B: b}
+		}
+		ac, alias, err := ambilightController(ambilightDevice)
+		if err != nil {
+			return err
+		}
+		// Budget the effect's own duration plus slack for the final restore.
+		ctx, cancel := context.WithTimeout(cmd.Context(), ambilightDur+5*time.Second)
+		defer cancel()
+		ui.Infof(cmd.ErrOrStderr(), "Running %s on %s for %s (Ctrl-C to stop)…", cmd.Name(), alias, ambilightDur)
+		err = ac.RunAmbilightEffect(ctx, build(col), ambilightFPS, ambilightDur, !ambilightNoRestore)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			return err
+		}
+		ui.Successf(cmd.OutOrStdout(), "%s ambilight %s finished", alias, cmd.Name())
+		return nil
+	}
 }
 
 func init() {
 	ambilightCmd.PersistentFlags().StringVar(&ambilightDevice, "device", "", "alias of a paired device (default: configured default)")
-	ambilightCmd.PersistentFlags().DurationVar(&ambilightTimeout, "timeout", 8*time.Second, "request timeout")
-	ambilightCmd.AddCommand(
-		ambilightOnCmd, ambilightOffCmd,
-		ambilightModeCmd,
-		ambilightStyleCmd,
-		ambilightColorCmd,
-		ambilightTopologyCmd,
-	)
+	ambilightCmd.PersistentFlags().DurationVar(&ambilightTimeout, "timeout", 5*time.Second, "request timeout")
+	ambilightCmd.AddCommand(ambilightOnCmd, ambilightOffCmd, ambilightStyleCmd, ambilightColorCmd)
+
+	for _, e := range ambilightEffects {
+		c := &cobra.Command{Use: e.use, Short: e.short, Args: cobra.NoArgs, RunE: runAmbilightEffect(e.build, e.usesColor)}
+		c.Flags().DurationVar(&ambilightDur, "duration", 10*time.Second, "how long to run the effect")
+		c.Flags().IntVar(&ambilightFPS, "fps", 20, "frames per second (1-30)")
+		c.Flags().BoolVar(&ambilightNoRestore, "no-restore", false, "leave Ambilight in manual mode on exit")
+		if e.usesColor {
+			c.Flags().StringVar(&ambilightColor, "color", "#00AAFF", "effect color (#RRGGBB)")
+		}
+		ambilightCmd.AddCommand(c)
+	}
 	rootCmd.AddCommand(ambilightCmd)
 }
 
-func runAmbilightStatus(cmd *cobra.Command, _ []string) error {
-	ctx, cancel := context.WithTimeout(cmd.Context(), ambilightTimeout)
-	defer cancel()
-	c, alias, err := openClient(ambilightDevice)
-	if err != nil {
-		return err
+// parseHexColor parses "#RRGGBB" or "RRGGBB" into 8-bit channels.
+func parseHexColor(s string) (r, g, b uint8, err error) {
+	h := strings.TrimPrefix(strings.TrimSpace(s), "#")
+	if len(h) != 6 {
+		return 0, 0, 0, fmt.Errorf("invalid color %q — use #RRGGBB", s)
 	}
-	power, err := c.Ambilight.GetPower(ctx)
-	if err != nil {
-		return fmt.Errorf("get power: %w", err)
+	v, perr := strconv.ParseUint(h, 16, 32)
+	if perr != nil {
+		return 0, 0, 0, fmt.Errorf("invalid color %q: %w", s, perr)
 	}
-	mode, err := c.Ambilight.GetMode(ctx)
-	if err != nil {
-		return fmt.Errorf("get mode: %w", err)
-	}
-	// Style is best-effort — older firmware 404s.
-	var styleName philips.AmbilightStyleName
-	var menuSetting string
-	if cfg, err := c.Ambilight.Configuration(ctx); err == nil {
-		styleName = cfg.StyleName
-		menuSetting = cfg.MenuSetting
-	} else if !philips.IsNotFound(err) {
-		return fmt.Errorf("get configuration: %w", err)
-	}
-	if jsonOutput {
-		enc := json.NewEncoder(cmd.OutOrStdout())
-		enc.SetIndent("", "  ")
-		return enc.Encode(map[string]any{
-			"alias":        alias,
-			"power":        power,
-			"mode":         mode,
-			"style":        styleName,
-			"menu_setting": menuSetting,
-		})
-	}
-	tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
-	fmt.Fprintf(tw, "power:\t%s\n", power)
-	fmt.Fprintf(tw, "mode:\t%s\n", mode)
-	if styleName != "" {
-		if menuSetting != "" {
-			fmt.Fprintf(tw, "style:\t%s (%s)\n", styleName, menuSetting)
-		} else {
-			fmt.Fprintf(tw, "style:\t%s\n", styleName)
-		}
-	}
-	return tw.Flush()
-}
-
-func runAmbilightPower(cmd *cobra.Command, p philips.AmbilightPower) error {
-	ctx, cancel := context.WithTimeout(cmd.Context(), ambilightTimeout)
-	defer cancel()
-	c, _, err := openClient(ambilightDevice)
-	if err != nil {
-		return err
-	}
-	return c.Ambilight.SetPower(ctx, p)
-}
-
-func runAmbilightMode(cmd *cobra.Command, args []string) error {
-	mode := philips.AmbilightMode(strings.ToLower(args[0]))
-	switch mode {
-	case philips.AmbilightModeInternal, philips.AmbilightModeManual, philips.AmbilightModeExpert:
-	default:
-		return fmt.Errorf("invalid mode %q (want internal|manual|expert)", args[0])
-	}
-	ctx, cancel := context.WithTimeout(cmd.Context(), ambilightTimeout)
-	defer cancel()
-	c, _, err := openClient(ambilightDevice)
-	if err != nil {
-		return err
-	}
-	return c.Ambilight.SetMode(ctx, mode)
-}
-
-func runAmbilightStyle(cmd *cobra.Command, args []string) error {
-	ctx, cancel := context.WithTimeout(cmd.Context(), ambilightTimeout)
-	defer cancel()
-	c, alias, err := openClient(ambilightDevice)
-	if err != nil {
-		return err
-	}
-
-	if len(args) == 0 {
-		styles, err := c.Ambilight.SupportedStyles(ctx)
-		if err != nil {
-			if philips.IsNotFound(err) {
-				return errors.New("this TV does not expose styles — try `mode manual` + `color`")
-			}
-			return fmt.Errorf("list styles: %w", err)
-		}
-		if jsonOutput {
-			enc := json.NewEncoder(cmd.OutOrStdout())
-			enc.SetIndent("", "  ")
-			return enc.Encode(map[string]any{"alias": alias, "styles": styles})
-		}
-		tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "STYLE\tALGORITHM")
-		for _, s := range styles {
-			fmt.Fprintf(tw, "%s\t%s\n", s.StyleName, s.Algorithm)
-		}
-		return tw.Flush()
-	}
-
-	cfg := philips.AmbilightConfiguration{
-		StyleName: philips.AmbilightStyleName(strings.ToUpper(args[0])),
-	}
-	if err := c.Ambilight.SetConfiguration(ctx, cfg); err != nil {
-		return fmt.Errorf("set style %q: %w", args[0], err)
-	}
-	fmt.Fprintf(cmd.OutOrStdout(), "%s: style %s\n", alias, cfg.StyleName)
-	return nil
-}
-
-func runAmbilightColor(cmd *cobra.Command, args []string) error {
-	color, err := parseAmbilightColor(args[0])
-	if err != nil {
-		return err
-	}
-	ctx, cancel := context.WithTimeout(cmd.Context(), ambilightTimeout)
-	defer cancel()
-	c, alias, err := openClient(ambilightDevice)
-	if err != nil {
-		return err
-	}
-	if _, err := c.Ambilight.SetSolidColor(ctx, color); err != nil {
-		return fmt.Errorf("set color: %w", err)
-	}
-	fmt.Fprintf(cmd.OutOrStdout(), "%s: painted #%02x%02x%02x\n", alias, color.R, color.G, color.B)
-	return nil
-}
-
-func runAmbilightTopology(cmd *cobra.Command, _ []string) error {
-	ctx, cancel := context.WithTimeout(cmd.Context(), ambilightTimeout)
-	defer cancel()
-	c, alias, err := openClient(ambilightDevice)
-	if err != nil {
-		return err
-	}
-	top, err := c.Ambilight.Topology(ctx)
-	if err != nil {
-		return fmt.Errorf("topology: %w", err)
-	}
-	if jsonOutput {
-		enc := json.NewEncoder(cmd.OutOrStdout())
-		enc.SetIndent("", "  ")
-		return enc.Encode(map[string]any{
-			"alias":    alias,
-			"layers":   top.Layers,
-			"left":     top.Left,
-			"top":      top.Top,
-			"right":    top.Right,
-			"bottom":   top.Bottom,
-		})
-	}
-	tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
-	fmt.Fprintf(tw, "layers:\t%d\n", top.Layers)
-	fmt.Fprintf(tw, "left:\t%d\n", top.Left)
-	fmt.Fprintf(tw, "top:\t%d\n", top.Top)
-	fmt.Fprintf(tw, "right:\t%d\n", top.Right)
-	fmt.Fprintf(tw, "bottom:\t%d\n", top.Bottom)
-	return tw.Flush()
-}
-
-// namedAmbilightColors covers the handful of presets pylips ships, so users
-// familiar with that CLI can reuse the same names.
-var namedAmbilightColors = map[string]philips.AmbilightColor{
-	"black":     {R: 0, G: 0, B: 0},
-	"white":     {R: 255, G: 255, B: 255},
-	"warmwhite": {R: 255, G: 200, B: 120},
-	"red":       {R: 255, G: 0, B: 0},
-	"green":     {R: 0, G: 255, B: 0},
-	"blue":      {R: 0, G: 0, B: 255},
-	"yellow":    {R: 255, G: 255, B: 0},
-	"cyan":      {R: 0, G: 255, B: 255},
-	"magenta":   {R: 255, G: 0, B: 255},
-	"orange":    {R: 255, G: 128, B: 0},
-	"purple":    {R: 128, G: 0, B: 128},
-}
-
-// parseAmbilightColor accepts "#RRGGBB", "RRGGBB", or a named preset.
-func parseAmbilightColor(s string) (philips.AmbilightColor, error) {
-	s = strings.TrimSpace(s)
-	if c, ok := namedAmbilightColors[strings.ToLower(s)]; ok {
-		return c, nil
-	}
-	hex := strings.TrimPrefix(s, "#")
-	if len(hex) != 6 {
-		return philips.AmbilightColor{}, fmt.Errorf("color %q: want #RRGGBB or a preset name (e.g. red, warmwhite)", s)
-	}
-	r, errR := strconv.ParseUint(hex[0:2], 16, 8)
-	g, errG := strconv.ParseUint(hex[2:4], 16, 8)
-	b, errB := strconv.ParseUint(hex[4:6], 16, 8)
-	if errR != nil || errG != nil || errB != nil {
-		return philips.AmbilightColor{}, fmt.Errorf("color %q: invalid hex", s)
-	}
-	return philips.AmbilightColor{R: uint8(r), G: uint8(g), B: uint8(b)}, nil
+	return uint8(v >> 16), uint8(v >> 8), uint8(v), nil
 }

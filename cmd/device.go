@@ -12,8 +12,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/chrris99/couchcli/internal/config"
-	"github.com/chrris99/couchcli/internal/philips"
+	"github.com/chrris99/couchcli/internal/device"
+	"github.com/chrris99/couchcli/internal/registry"
+	"github.com/chrris99/couchcli/internal/ui"
 	"github.com/chrris99/couchcli/internal/wol"
 )
 
@@ -43,13 +44,12 @@ var deviceOnCmd = &cobra.Command{
 	Long: `Power the TV on using the canonical /6/powerstate endpoint.
 
 Behaviour:
-  1. If the JointSpace API is reachable, GET /6/powerstate.
-     - "On"      → no-op, print "already on".
-     - "Standby" → POST powerstate=On and poll until reported "On".
-     - 404       → older firmware, send the Standby key as a toggle.
+  1. If the control API is reachable, read the power state.
+     - On      → no-op, print "already on".
+     - Standby → power on and poll until reported "On".
+     - unsupported → older firmware, send the Standby key as a toggle.
   2. If the API is unreachable, send a Wake-on-LAN magic packet to the
-     stored MAC, then wait for the API to come back and ensure
-     powerstate=On.
+     stored MAC, then wait for the API to come back and ensure it is on.
 
 The MAC is only required for step 2. Most Android Philips TVs in soft
 standby answer step 1 directly — WoL is rarely needed.
@@ -91,63 +91,52 @@ func init() {
 // resolveDeviceEntry returns the saved device entry for alias. If alias is ""
 // the default entry is used; if there's no default but exactly one device is
 // stored, that one is used.
-func resolveDeviceEntry(alias string) (*config.Device, string, error) {
-	schema, _, err := config.Load()
+func resolveDeviceEntry(alias string) (*registry.Device, string, error) {
+	reg, err := registry.Load()
 	if err != nil {
 		return nil, "", err
 	}
-	if len(schema.Devices) == 0 {
+	if len(reg.Devices) == 0 {
 		return nil, "", fmt.Errorf("no paired devices — run `couch pair` first")
 	}
 	if alias == "" {
-		alias = schema.Default
+		alias = reg.Default
 	}
 	if alias == "" {
-		if len(schema.Devices) == 1 {
-			for k := range schema.Devices {
-				alias = k
-			}
-		} else {
-			return nil, "", fmt.Errorf("no default device — pass --device <alias> (paired: %s)", deviceAliases(schema))
+		aliases := reg.Aliases()
+		if len(aliases) != 1 {
+			return nil, "", fmt.Errorf("no default device — pass --device <alias> (paired: %s)", strings.Join(aliases, ", "))
 		}
+		alias = aliases[0]
 	}
-	d, ok := schema.Get(alias)
+	d, ok := reg.Get(alias)
 	if !ok {
-		return nil, "", fmt.Errorf("no device %q (paired: %s)", alias, deviceAliases(schema))
+		return nil, "", fmt.Errorf("no device %q (paired: %s)", alias, strings.Join(reg.Aliases(), ", "))
 	}
 	return d, alias, nil
 }
 
-// openClient resolves an alias and builds a JointSpace client preloaded with
-// the stored digest credentials.
-func openClient(alias string) (*philips.Client, string, error) {
-	entry, resolvedAlias, err := resolveDeviceEntry(alias)
+// powerController resolves an alias to a device that supports power control.
+func powerController(alias string) (device.PowerController, string, error) {
+	dev, resolved, err := openDevice(alias)
 	if err != nil {
 		return nil, "", err
 	}
-	var c *philips.Client
-	if entry.Secure {
-		c = philips.NewSecure(entry.Address)
-	} else {
-		c = philips.NewPlain(entry.Address)
+	pc, ok := dev.(device.PowerController)
+	if !ok {
+		return nil, resolved, fmt.Errorf("%s does not support power control", resolved)
 	}
-	if entry.DeviceID != "" && entry.AuthKey != "" {
-		c.WithDigest(entry.DeviceID, entry.AuthKey)
-	}
-	return c, resolvedAlias, nil
+	return pc, resolved, nil
 }
 
-func deviceAliases(s *config.Schema) string {
-	out := ""
-	first := true
-	for a := range s.Devices {
-		if !first {
-			out += ", "
-		}
-		out += a
-		first = false
-	}
-	return out
+// powerReachable reports whether the device's control API answers within
+// timeout. A powerstate the driver cannot read (ErrUnsupported) still counts as
+// reachable — the API responded.
+func powerReachable(ctx context.Context, pc device.PowerController, timeout time.Duration) bool {
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	_, err := pc.Power(probeCtx)
+	return err == nil || errors.Is(err, device.ErrUnsupported)
 }
 
 // firstArgOrEmpty returns args[0] if present, else "". Used by subcommands
@@ -167,39 +156,39 @@ func runDeviceOn(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	client, _, err := openClient(alias)
+	pc, _, err := powerController(alias)
 	if err != nil {
 		return err
 	}
 	out := cmd.OutOrStdout()
 	deadline := time.Now().Add(deviceOnWait)
 
-	// Phase A: try the direct /6/powerstate path unless --force-wol is set.
-	if !deviceOnForce && client.System.IsReachable(cmd.Context(), 1500*time.Millisecond) {
-		state, err := client.Power.Get(cmd.Context())
+	// Phase A: try the direct powerstate path unless --force-wol is set.
+	if !deviceOnForce && powerReachable(cmd.Context(), pc, 1500*time.Millisecond) {
+		state, err := pc.Power(cmd.Context())
 		switch {
-		case errors.Is(err, philips.ErrPowerstateUnsupported):
-			fmt.Fprintf(out, "%s: /6/powerstate unsupported; sending Standby key as a toggle\n", alias)
-			if err := client.Keys.Standby(cmd.Context()); err != nil {
-				return fmt.Errorf("send standby key: %w", err)
+		case errors.Is(err, device.ErrUnsupported):
+			ui.Infof(out, "%s: powerstate unsupported; toggling power via the Standby key", alias)
+			if err := pc.PowerOn(cmd.Context()); err != nil {
+				return fmt.Errorf("toggle power: %w", err)
 			}
 			return nil
 		case err != nil:
 			return fmt.Errorf("read powerstate: %w", err)
-		case state == philips.PowerOn:
-			fmt.Fprintf(out, "%s is already on.\n", alias)
+		case state == device.PowerOn:
+			ui.Successf(out, "%s is already on.", alias)
 			return nil
-		case state == philips.PowerStandby:
-			fmt.Fprintf(out, "%s is in standby — sending powerstate=On\n", alias)
-			if err := client.Power.On(cmd.Context()); err != nil {
-				return fmt.Errorf("set powerstate=On: %w", err)
+		case state == device.PowerStandby:
+			ui.Infof(out, "%s is in standby — powering on", alias)
+			if err := pc.PowerOn(cmd.Context()); err != nil {
+				return fmt.Errorf("power on: %w", err)
 			}
 			if deviceOnNoWait {
 				return nil
 			}
-			return waitOn(cmd.Context(), client, out, alias, time.Until(deadline))
+			return waitOn(cmd.Context(), pc, out, alias, time.Until(deadline))
 		default:
-			fmt.Fprintf(out, "%s reported unexpected powerstate %q — continuing\n", alias, state)
+			ui.Warnf(out, "%s reported unexpected power state %q — continuing", alias, state)
 		}
 	}
 
@@ -212,7 +201,7 @@ func runDeviceOn(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("stored MAC %q is invalid: %w", entry.MAC, err)
 	}
 
-	fmt.Fprintf(out, "Sending Wake-on-LAN to %s (%s) via %s\n", alias, entry.MAC, deviceOnAddr)
+	ui.Infof(out, "Sending Wake-on-LAN to %s (%s) via %s", alias, entry.MAC, deviceOnAddr)
 	sendCtx, sendCancel := context.WithTimeout(cmd.Context(), 5*time.Second)
 	err = wol.Send(sendCtx, mac, wol.Options{Addr: deviceOnAddr, Count: deviceOnCount})
 	sendCancel()
@@ -220,54 +209,54 @@ func runDeviceOn(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("send magic packet: %w", err)
 	}
 	if deviceOnNoWait {
-		fmt.Fprintln(out, "Magic packet sent.")
+		ui.Infof(out, "Magic packet sent.")
 		return nil
 	}
 
-	// Phase C: wait for the API to come back, then ensure powerstate=On.
-	fmt.Fprintf(out, "Waiting up to %s for the TV to come online…\n", time.Until(deadline).Round(time.Second))
-	if err := waitReachable(cmd.Context(), client, alias, time.Until(deadline)); err != nil {
+	// Phase C: wait for the API to come back, then ensure it is on.
+	ui.Infof(out, "Waiting up to %s for the TV to come online…", time.Until(deadline).Round(time.Second))
+	if err := waitReachable(cmd.Context(), pc, alias, time.Until(deadline)); err != nil {
 		return err
 	}
-	state, err := client.Power.Get(cmd.Context())
+	state, err := pc.Power(cmd.Context())
 	switch {
-	case errors.Is(err, philips.ErrPowerstateUnsupported):
+	case errors.Is(err, device.ErrUnsupported):
 		// Older firmware — best-effort: TV came back, we're done.
-		fmt.Fprintf(out, "%s is reachable (powerstate unsupported, assuming on).\n", alias)
+		ui.Successf(out, "%s is reachable (powerstate unsupported, assuming on).", alias)
 		return nil
 	case err != nil:
 		return fmt.Errorf("read powerstate after WoL: %w", err)
-	case state == philips.PowerOn:
-		fmt.Fprintf(out, "%s is on.\n", alias)
+	case state == device.PowerOn:
+		ui.Successf(out, "%s is on.", alias)
 		return nil
-	case state == philips.PowerStandby:
-		if err := client.Power.On(cmd.Context()); err != nil {
-			return fmt.Errorf("set powerstate=On after WoL: %w", err)
+	case state == device.PowerStandby:
+		if err := pc.PowerOn(cmd.Context()); err != nil {
+			return fmt.Errorf("power on after WoL: %w", err)
 		}
-		return waitOn(cmd.Context(), client, out, alias, time.Until(deadline))
+		return waitOn(cmd.Context(), pc, out, alias, time.Until(deadline))
 	default:
-		fmt.Fprintf(out, "%s reported powerstate %q after WoL.\n", alias, state)
+		ui.Warnf(out, "%s reported power state %q after WoL.", alias, state)
 		return nil
 	}
 }
 
-// waitOn polls Power.Get every 500ms until the TV reports "On" or budget
+// waitOn polls Power every 500ms until the TV reports PowerOn or the budget
 // runs out. budget <= 0 returns immediately with an error.
-func waitOn(ctx context.Context, client *philips.Client, out io.Writer, alias string, budget time.Duration) error {
+func waitOn(ctx context.Context, pc device.PowerController, out io.Writer, alias string, budget time.Duration) error {
 	if budget <= 0 {
-		return fmt.Errorf("%s did not reach powerstate=On in time", alias)
+		return fmt.Errorf("%s did not power on in time", alias)
 	}
 	deadline := time.Now().Add(budget)
 	tick := time.NewTicker(500 * time.Millisecond)
 	defer tick.Stop()
 	for {
-		state, err := client.Power.Get(ctx)
-		if err == nil && state == philips.PowerOn {
-			fmt.Fprintf(out, "%s is on.\n", alias)
+		state, err := pc.Power(ctx)
+		if err == nil && state == device.PowerOn {
+			ui.Successf(out, "%s is on.", alias)
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("%s did not reach powerstate=On within %s", alias, budget)
+			return fmt.Errorf("%s did not power on within %s", alias, budget)
 		}
 		select {
 		case <-ctx.Done():
@@ -277,8 +266,9 @@ func waitOn(ctx context.Context, client *philips.Client, out io.Writer, alias st
 	}
 }
 
-// waitReachable polls System.IsReachable every 500ms until budget runs out.
-func waitReachable(ctx context.Context, client *philips.Client, alias string, budget time.Duration) error {
+// waitReachable polls the control API every 500ms until it answers or the
+// budget runs out.
+func waitReachable(ctx context.Context, pc device.PowerController, alias string, budget time.Duration) error {
 	if budget <= 0 {
 		return fmt.Errorf("%s did not respond in time — check that Wake-on-LAN/WoWLAN is enabled in the TV's network settings", alias)
 	}
@@ -286,7 +276,7 @@ func waitReachable(ctx context.Context, client *philips.Client, alias string, bu
 	tick := time.NewTicker(500 * time.Millisecond)
 	defer tick.Stop()
 	for {
-		if client.System.IsReachable(ctx, 800*time.Millisecond) {
+		if powerReachable(ctx, pc, 800*time.Millisecond) {
 			return nil
 		}
 		if time.Now().After(deadline) {
@@ -303,19 +293,14 @@ func waitReachable(ctx context.Context, client *philips.Client, alias string, bu
 func runDeviceOff(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(cmd.Context(), deviceOffWait)
 	defer cancel()
-	c, alias, err := openClient(firstArgOrEmpty(args))
+	pc, alias, err := powerController(firstArgOrEmpty(args))
 	if err != nil {
 		return err
 	}
-	err = c.Power.Standby(ctx)
-	if errors.Is(err, philips.ErrPowerstateUnsupported) {
-		// Older firmware — fall back to the toggle key.
-		err = c.Keys.Standby(ctx)
-	}
-	if err != nil {
+	if err := pc.Standby(ctx); err != nil {
 		return fmt.Errorf("send standby: %w", err)
 	}
-	fmt.Fprintf(cmd.OutOrStdout(), "%s sent to standby.\n", alias)
+	ui.Successf(cmd.OutOrStdout(), "%s sent to standby.", alias)
 	return nil
 }
 
@@ -324,25 +309,26 @@ func runDeviceStatus(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	client, _, err := openClient(alias)
+	pc, _, err := powerController(alias)
 	if err != nil {
 		return err
 	}
 
-	reachable := client.System.IsReachable(cmd.Context(), deviceProbeWait)
-	state := "unreachable"
-	if reachable {
-		probeCtx, cancel := context.WithTimeout(cmd.Context(), deviceProbeWait)
-		p, perr := client.Power.Get(probeCtx)
-		cancel()
-		switch {
-		case errors.Is(perr, philips.ErrPowerstateUnsupported):
-			state = "reachable" // older firmware; we cannot say on vs standby
-		case perr != nil:
-			state = fmt.Sprintf("error: %v", perr)
-		default:
-			state = strings.ToLower(p) // "on" / "standby"
-		}
+	probeCtx, cancel := context.WithTimeout(cmd.Context(), deviceProbeWait)
+	p, perr := pc.Power(probeCtx)
+	cancel()
+	var state string
+	switch {
+	case errors.Is(perr, device.ErrUnsupported):
+		state = "reachable" // answered, but cannot say on vs standby
+	case perr != nil:
+		state = "unreachable"
+	case p == device.PowerOn:
+		state = "on"
+	case p == device.PowerStandby:
+		state = "standby"
+	default:
+		state = "reachable"
 	}
 
 	if jsonOutput {
@@ -352,10 +338,10 @@ func runDeviceStatus(cmd *cobra.Command, args []string) error {
 			"alias":      alias,
 			"address":    entry.Address,
 			"mac":        entry.MAC,
-			"reachable":  reachable,
+			"reachable":  state != "unreachable",
 			"powerstate": state,
 		})
 	}
-	fmt.Fprintf(cmd.OutOrStdout(), "%s (%s): %s\n", alias, entry.Address, state)
+	fmt.Fprintf(ui.Out(cmd.OutOrStdout()), "%s %s %s\n", ui.StatusBadge(state), alias, ui.Subtle.Render("("+entry.Address+")"))
 	return nil
 }

@@ -8,6 +8,9 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+
+	"github.com/chrris99/couchcli/internal/device"
+	"github.com/chrris99/couchcli/internal/ui"
 )
 
 var (
@@ -21,8 +24,8 @@ var volumeCmd = &cobra.Command{
 	Long: `Control the volume on a paired device.
 
   couch volume          Show current volume
-  couch volume up [N]   Press VolumeUp N times (default 1)
-  couch volume down [N] Press VolumeDown N times (default 1)
+  couch volume up [N]   Raise volume by N steps (default 1)
+  couch volume down [N] Lower volume by N steps (default 1)
   couch volume mute     Toggle mute`,
 	RunE: runVolumeGet,
 }
@@ -55,14 +58,27 @@ func init() {
 	rootCmd.AddCommand(volumeCmd)
 }
 
+// volumeController resolves an alias to a device that supports volume control.
+func volumeController(alias string) (device.VolumeController, string, error) {
+	dev, resolved, err := openDevice(alias)
+	if err != nil {
+		return nil, "", err
+	}
+	vc, ok := dev.(device.VolumeController)
+	if !ok {
+		return nil, resolved, fmt.Errorf("%s does not support volume control", resolved)
+	}
+	return vc, resolved, nil
+}
+
 func runVolumeGet(cmd *cobra.Command, _ []string) error {
 	ctx, cancel := context.WithTimeout(cmd.Context(), volumeTimeout)
 	defer cancel()
-	c, alias, err := openClient(volumeDevice)
+	vc, alias, err := volumeController(volumeDevice)
 	if err != nil {
 		return err
 	}
-	v, err := c.Volume.Get(ctx)
+	v, err := vc.Volume(ctx)
 	if err != nil {
 		return fmt.Errorf("get volume: %w", err)
 	}
@@ -71,17 +87,14 @@ func runVolumeGet(cmd *cobra.Command, _ []string) error {
 		enc.SetIndent("", "  ")
 		return enc.Encode(map[string]any{
 			"alias":   alias,
-			"current": v.Current,
+			"current": v.Level,
 			"min":     v.Min,
 			"max":     v.Max,
 			"muted":   v.Muted,
+			"percent": v.Percent(),
 		})
 	}
-	muted := ""
-	if v.Muted {
-		muted = " (muted)"
-	}
-	fmt.Fprintf(cmd.OutOrStdout(), "%s: %d / %d%s\n", alias, v.Current, v.Max, muted)
+	fmt.Fprintln(ui.Out(cmd.OutOrStdout()), ui.VolumeLine(alias, v))
 	return nil
 }
 
@@ -95,25 +108,34 @@ func runVolumeStep(up bool) func(*cobra.Command, []string) error {
 			}
 			count = n
 		}
-		ctx, cancel := context.WithTimeout(cmd.Context(), volumeTimeout+time.Duration(count)*200*time.Millisecond)
+		ctx, cancel := context.WithTimeout(cmd.Context(), volumeTimeout)
 		defer cancel()
-		c, _, err := openClient(volumeDevice)
+		vc, _, err := volumeController(volumeDevice)
 		if err != nil {
 			return err
 		}
-		if up {
-			return c.Volume.Up(ctx, count)
+		v, err := vc.Volume(ctx)
+		if err != nil {
+			return fmt.Errorf("get volume: %w", err)
 		}
-		return c.Volume.Down(ctx, count)
+		target := v.Level + count
+		if !up {
+			target = v.Level - count
+		}
+		return vc.SetVolume(ctx, target)
 	}
 }
 
 func runVolumeMute(cmd *cobra.Command, _ []string) error {
 	ctx, cancel := context.WithTimeout(cmd.Context(), volumeTimeout)
 	defer cancel()
-	c, _, err := openClient(volumeDevice)
+	vc, _, err := volumeController(volumeDevice)
 	if err != nil {
 		return err
 	}
-	return c.Volume.Mute(ctx)
+	v, err := vc.Volume(ctx)
+	if err != nil {
+		return fmt.Errorf("get volume: %w", err)
+	}
+	return vc.SetMuted(ctx, !v.Muted)
 }

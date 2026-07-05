@@ -1,6 +1,6 @@
 // Package wol sends Wake-on-LAN magic packets over UDP broadcast.
 //
-// A magic packet is a fixed-shape frame the TV's NIC scans for while in
+// A magic packet is a fixed-shape frame the device's NIC scans for while in
 // standby: a synchronization header of six 0xFF bytes, followed by 16
 // repetitions of the target 6-byte MAC. Total length is 102 bytes.
 //
